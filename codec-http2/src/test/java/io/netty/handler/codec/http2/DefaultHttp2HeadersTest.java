@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Map.Entry;
 
@@ -55,6 +56,86 @@ public class DefaultHttp2HeadersTest {
                 new DefaultHttp2Headers().add(StringUtil.EMPTY_STRING, "foo");
             }
         });
+    }
+
+    @ParameterizedTest
+    @ValueSource(chars = {'\0', '\n', '\r'})
+    public void headerValueValidationIsEnabledByDefault(final char illegalChar) {
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new DefaultHttp2Headers().add("headername", "fo" + illegalChar + "o");
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(chars = {'\0', '\n', '\r'})
+    public void headerValueValidationIsEnabledWhenValidating(final char illegalChar) {
+        final String value = "fo" + illegalChar + "o";
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new DefaultHttp2Headers(true).add("headername", value);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new DefaultHttp2Headers(true, 16).add("headername", value);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new DefaultHttp2Headers().set("headername", value);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new DefaultHttp2Headers().path("/" + value);
+            }
+        });
+    }
+
+    @Test
+    public void headerValueValidationCanBeDisabled() {
+        Http2Headers headers = new DefaultHttp2Headers(true, false, 16).add("headername", "fo\r\no");
+        assertEquals("fo\r\no", headers.get("headername"));
+        headers = new DefaultHttp2Headers(false).add("headername", "fo\r\no");
+        assertEquals("fo\r\no", headers.get("headername"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(chars = {'\0', '\n', '\r'})
+    public void headerValueValidationIsNotBypassedWhenCopyingHeaders(final char illegalChar) {
+        final Http2Headers source = new DefaultHttp2Headers(true, false, 16)
+                .add("headername", "fo" + illegalChar + "o");
+        final Http2Headers headers = new DefaultHttp2Headers();
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.add(source);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.set(source);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.setAll(source);
+            }
+        });
+        assertTrue(headers.isEmpty());
+
+        // Copying into headers that do not validate values is still possible.
+        Http2Headers nonValidating = new DefaultHttp2Headers(true, false, 16).add(source);
+        assertEquals(source, nonValidating);
     }
 
     @Test

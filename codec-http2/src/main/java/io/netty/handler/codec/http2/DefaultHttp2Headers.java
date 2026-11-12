@@ -16,10 +16,13 @@ package io.netty.handler.codec.http2;
 
 import io.netty.handler.codec.CharSequenceValueConverter;
 import io.netty.handler.codec.DefaultHeaders;
+import io.netty.handler.codec.Headers;
 import io.netty.handler.codec.http.HttpHeaderValidationUtil;
 import io.netty.util.AsciiString;
 import io.netty.util.ByteProcessor;
 import io.netty.util.internal.PlatformDependent;
+
+import java.util.Map.Entry;
 
 import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.connectionError;
@@ -82,7 +85,7 @@ public class DefaultHttp2Headers
         }
     };
 
-    private static final ValueValidator<CharSequence> VALUE_VALIDATOR = new ValueValidator<CharSequence>() {
+    static final ValueValidator<CharSequence> HTTP2_VALUE_VALIDATOR = new ValueValidator<CharSequence>() {
         @Override
         public void validate(CharSequence value) {
             int index = HttpHeaderValidationUtil.validateValidHeaderValue(value);
@@ -98,65 +101,56 @@ public class DefaultHttp2Headers
     /**
      * Create a new instance.
      * <p>
-     * Header names will be validated according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>.
+     * Header names and values will be validated according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>.
      */
     public DefaultHttp2Headers() {
-        this(true);
+        this(true, true, 16);
     }
 
     /**
      * Create a new instance.
-     * @param validate {@code true} to validate header names according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>. {@code false} to not validate header names.
+     * @param validate {@code true} to validate header names and values according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>.
+     * {@code false} to not validate header names or values.
      */
-    @SuppressWarnings("unchecked")
     public DefaultHttp2Headers(boolean validate) {
-        // Case sensitive compare is used because it is cheaper, and header validation can be used to catch invalid
-        // headers.
-        super(CASE_SENSITIVE_HASHER,
-              CharSequenceValueConverter.INSTANCE,
-              validate ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL);
+        this(validate, validate, 16);
     }
 
     /**
      * Create a new instance.
-     * @param validate {@code true} to validate header names according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>. {@code false} to not validate header names.
+     * @param validate {@code true} to validate header names and values according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>.
+     * {@code false} to not validate header names or values.
      * @param arraySizeHint A hint as to how large the hash data structure should be.
      * The next positive power of two will be used. An upper bound may be enforced.
      * @see DefaultHttp2Headers#DefaultHttp2Headers(boolean, boolean, int)
      */
     @SuppressWarnings("unchecked")
     public DefaultHttp2Headers(boolean validate, int arraySizeHint) {
-        // Case sensitive compare is used because it is cheaper, and header validation can be used to catch invalid
-        // headers.
-        super(CASE_SENSITIVE_HASHER,
-              CharSequenceValueConverter.INSTANCE,
-              validate ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL,
-              arraySizeHint);
+        this(validate, validate, arraySizeHint);
     }
 
     /**
      * Create a new instance.
-     * @param validate {@code true} to validate header names according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>. {@code false} to not validate header names.
+     * @param validateNames {@code true} to validate header names according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>. {@code false} to not validate header names.
      * @param validateValues {@code true} to validate header values according to
-     * <a href="https://datatracker.ietf.org/doc/html/rfc7230#section-3.2">rfc7230</a> and
-     * <a href="https://datatracker.ietf.org/doc/html/rfc5234#appendix-B.1">rfc5234</a>. Otherwise, {@code false}
-     * (the default) to not validate values.
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html#name-http-fields">RFC 9113</a>. Otherwise, {@code false}
+     * to not validate values.
      * @param arraySizeHint A hint as to how large the hash data structure should be.
      * The next positive power of two will be used. An upper bound may be enforced.
      */
     @SuppressWarnings("unchecked")
-    public DefaultHttp2Headers(boolean validate, boolean validateValues, int arraySizeHint) {
+    public DefaultHttp2Headers(boolean validateNames, boolean validateValues, int arraySizeHint) {
         // Case sensitive compare is used because it is cheaper, and header validation can be used to catch invalid
         // headers.
         super(CASE_SENSITIVE_HASHER,
                 CharSequenceValueConverter.INSTANCE,
-                validate ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL,
+                validateNames ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL,
                 arraySizeHint,
-                validateValues ? VALUE_VALIDATOR : (ValueValidator<CharSequence>) ValueValidator.NO_VALIDATION);
+                validateValues ? HTTP2_VALUE_VALIDATOR : (ValueValidator<CharSequence>) ValueValidator.NO_VALIDATION);
     }
 
     @Override
@@ -181,6 +175,23 @@ public class DefaultHttp2Headers
             PlatformDependent.throwException(connectionError(
                     PROTOCOL_ERROR, "HTTP/2 pseudo-header '%s' must not be empty.", name));
         }
+    }
+
+    @Override
+    protected void addImpl(Headers<? extends CharSequence, ? extends CharSequence, ?> headers) {
+        // The fastest copy path of DefaultHeaders only compares the name validators, so values copied from
+        // headers which do not validate values would otherwise bypass the value validation of these headers.
+        if (headers instanceof DefaultHttp2Headers) {
+            DefaultHttp2Headers other = (DefaultHttp2Headers) headers;
+            ValueValidator<CharSequence> validator = valueValidator();
+            if (validator != ValueValidator.NO_VALIDATION && validator != other.valueValidator() &&
+                    nameValidator() == other.nameValidator()) {
+                for (Entry<CharSequence, CharSequence> header : other) {
+                    validateValue(validator, header.getKey(), header.getValue());
+                }
+            }
+        }
+        super.addImpl(headers);
     }
 
     @Override

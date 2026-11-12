@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -139,6 +140,40 @@ public class DefaultHttp2HeadersDecoderTest {
     public void duplicatePseudoHeadersMustFailValidation() throws Exception {
         final DefaultHttp2HeadersDecoder decoder = new DefaultHttp2HeadersDecoder(true);
         verifyValidationFails(decoder, encode(b(":authority"), b("abc"), b(":authority"), b("def")));
+    }
+
+    @Test
+    public void illegalHeaderValuesMustFailValidation() throws Exception {
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(), encode(b("headername"), b("fo\no")));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true), encode(b("headername"), b("fo\no")));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true, MAX_HEADER_LIST_SIZE),
+            encode(b("headername"), b("fo\no")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"fo\no", "fo\ro", "fo\0o", "fo\r\nx-injected: evil"})
+    public void illegalHeaderValuesMustFailValidationByDefault(String value) throws Exception {
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(), encode(b("headername"), b(value)));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true), encode(b("headername"), b(value)));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true, MAX_HEADER_LIST_SIZE),
+                encode(b("headername"), b(value)));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true, MAX_HEADER_LIST_SIZE, -1),
+                encode(b("headername"), b(value)));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(),
+                encode(b(":method"), b("GET"), b(":path"), b("/" + value)));
+    }
+
+    @Test
+    public void illegalHeaderValuesAllowedIfValueValidationIsDisabled() throws Exception {
+        final DefaultHttp2HeadersDecoder decoder = new DefaultHttp2HeadersDecoder(true, false);
+        ByteBuf buf = null;
+        try {
+            buf = encode(b(":method"), b("GET"), b("headername"), b("fo\no"));
+            Http2Headers headers = decoder.decodeHeaders(1, buf); // This must not throw.
+            assertEquals(new AsciiString("fo\no"), headers.get("headername"));
+        } finally {
+            ReferenceCountUtil.release(buf);
+        }
     }
 
     @Test
