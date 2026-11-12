@@ -24,11 +24,14 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
@@ -45,6 +48,7 @@ import static org.mockito.Mockito.mock;
 public class DelegatingDecompressorFrameListenerTest {
 
     private static final int CHUNK_SIZE = 1024 * 1024;
+    private static final int CHUNK_SIZE_SMALL = 8;
     private static final int NUM_CHUNKS = 256;
     // Total decompressed size is 256 MiB, so anything close to that means the decompressed data got accumulated.
     private static final int MEMORY_LIMIT = CHUNK_SIZE * 128;
@@ -97,6 +101,81 @@ public class DelegatingDecompressorFrameListenerTest {
 
             // ... because it is handed over buffer by buffer, never queuing up decompressed buffers.
             assertEquals(0, decoder.maxUndelivered, "decompressed buffers were accumulated before being forwarded");
+        } finally {
+            assertFalse(parent.finishAndReleaseAll());
+        }
+    }
+
+    /**
+     * Before the fix for CVE-2026-48043 the decompressed buffer was only released after the delegate
+     * {@link Http2FrameListener} and the local flow controller were invoked. A delegate (or flow controller) that
+     * throws therefore leaked the decompressed buffer, which a peer could trigger repeatedly to exhaust memory.
+     */
+    @Test
+    public void testDecompressedDataIsReleasedWhenDelegateThrows() throws Exception {
+        final ByteBuf[] decompressed = new ByteBuf[1];
+        final RuntimeException failure = new RuntimeException("delegate failure");
+
+        final ByteToMessageDecoder decoder = new ByteToMessageDecoder() {
+            @Override
+            protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+                if (!in.isReadable()) {
+                    return;
+                }
+                in.skipBytes(in.readableBytes());
+                ByteBuf chunk = ctx.alloc().buffer(CHUNK_SIZE_SMALL);
+                chunk.writeZero(CHUNK_SIZE_SMALL);
+                decompressed[0] = chunk;
+                out.add(chunk);
+            }
+        };
+
+        final Http2Connection connection = new DefaultHttp2Connection(true);
+        connection.local().flowController(mock(Http2LocalFlowController.class));
+        connection.remote().createStream(3, false);
+
+        final DelegatingDecompressorFrameListener frameListener =
+                new DelegatingDecompressorFrameListener(connection, new Http2FrameAdapter() {
+                    @Override
+                    public int onDataRead(ChannelHandlerContext ctx, int streamId, ByteBuf data, int padding,
+                                          boolean endOfStream) {
+                        if (data.isReadable()) {
+                            // Simulate a delegate listener that fails while processing the decompressed data.
+                            throw failure;
+                        }
+                        return data.readableBytes() + padding;
+                    }
+                }) {
+            @Override
+            protected EmbeddedChannel newContentDecompressor(ChannelHandlerContext ctx, CharSequence contentEncoding) {
+                return new EmbeddedChannel(decoder);
+            }
+        };
+
+        EmbeddedChannel parent = new EmbeddedChannel(new ChannelInboundHandlerAdapter());
+        try {
+            final ChannelHandlerContext ctx = parent.pipeline().firstContext();
+
+            Http2Headers headers = new DefaultHttp2Headers();
+            headers.set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.GZIP);
+            frameListener.onHeadersRead(ctx, 3, headers, 0, false);
+
+            final ByteBuf data = Unpooled.buffer(1);
+            data.writeZero(1);
+            try {
+                assertThrows(Http2Exception.class, new Executable() {
+                    @Override
+                    public void execute() throws Throwable {
+                        frameListener.onDataRead(ctx, 3, data, 0, false);
+                    }
+                });
+            } finally {
+                data.release();
+            }
+
+            assertNotNull(decompressed[0], "the decompressor did not produce any data");
+            // The decompressed buffer must not outlive the failed dispatch to the delegate listener.
+            assertEquals(0, decompressed[0].refCnt(), "decompressed buffer leaked when the delegate listener threw");
         } finally {
             assertFalse(parent.finishAndReleaseAll());
         }
